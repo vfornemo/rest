@@ -49,7 +49,7 @@ features = ["extension-module"]
 rustdoc-args = [
     "--html-in-header",
     #".cargo/registry/src/github.com-1ecc6299db9ec823/katex-doc-0.1.0/katex.html",
-    "/share/home/tygao/REST3.0/rest/katex.html",
+    "/share/home/tygao/REST4.0/rest/katex.html",
 
 ]
 

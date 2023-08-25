@@ -3,6 +3,7 @@ use std::sync::Arc;
 use std::vec;
 use itertools::Itertools;
 use rest_tensors::RIFull;
+use tensors::einsum::{_einsum_general, self};
 use tensors::{MatrixFull, ri};
 use tensors::matrix_blas_lapack::{_dgemm_nn, _dgemm_tn, _dgemm_full, _dgemm_full_new};
 //use crate::ctrl_io::SCFType;
@@ -231,6 +232,9 @@ pub struct Gradient {
     pub nuc_deriv: MatrixFull<f64>,
     pub ovlp_deriv: Vec<MatrixFull<f64>>,
     pub hcore_deriv: Vec<MatrixFull<f64>>,
+    pub vhf: Vec<MatrixFull<f64>>,
+    pub e1_aux: Option<Vec<MatrixFull<f64>>>,
+    
     //pub eri_deriv: Vec<RIFull<f64>>,
 }
 
@@ -241,6 +245,8 @@ impl Gradient {
             nuc_deriv: MatrixFull::empty(),
             ovlp_deriv: vec![],
             hcore_deriv: vec![],
+            vhf: vec![],
+            e1_aux: None,
         };
         grad_data
     }
@@ -253,6 +259,8 @@ impl Gradient {
             nuc_deriv: MatrixFull::empty(),
             ovlp_deriv: vec![],
             hcore_deriv: vec![],
+            vhf: vec![],
+            e1_aux: None,
         }
     }
 
@@ -262,19 +270,22 @@ impl Gradient {
             nuc_deriv: self.nuc_deriv.clone(),
             ovlp_deriv: self.ovlp_deriv.clone(),
             hcore_deriv: self.hcore_deriv.clone(),
+            vhf: self.vhf.clone(),
+            e1_aux: self.e1_aux.clone(),
         }
     }
 
     pub fn build(mol: &Molecule, scf: &SCF) -> Gradient {
         let mut grad_data = Gradient::new(mol);
         grad_data.nuc_deriv = grad_data.calc_nuc_energy_deriv();
-        grad_data.ovlp_deriv = grad_data.calc_ovlp_deriv();
-        grad_data.hcore_deriv = grad_data.calc_hcore_deriv();
-        let (vj, vjaux) = grad_data.calc_j(scf);
-        let (vk, vkaux) = grad_data.calc_k(scf);
+        grad_data.ovlp_deriv = grad_data.calc_ovlp_deriv();  //s1 [natm*3,nao,nao]
+        grad_data.hcore_deriv = grad_data.calc_hcore_deriv(); //h1ao [natm*3,nao,nao]
+        (grad_data.vhf, grad_data.e1_aux) = grad_data.calc_veff_deriv(scf);
 
+        let ao_slice = mol.aoslice_by_atom();
+        //println!("ovlp len = {},{:?}",grad_data.ovlp_deriv.len(),grad_data.ovlp_deriv[0].size);
 
-
+        
         grad_data
 
     }
@@ -464,22 +475,18 @@ impl Gradient {
         let mut ipri_y = RIFull::new([n_basis,n_basis,n_auxbas],0.0);
         let mut ipri_z = RIFull::new([n_basis,n_basis,n_auxbas],0.0);
         let n_basis_shell = self.mol.cint_bas.len();
-        println!("cint_bas = {:?} ", self.mol.cint_bas);
-        println!("n_basis_shell = {} ", n_basis_shell);
+        //println!("cint_bas = {:?} ", self.mol.cint_bas);
+        //println!("n_basis_shell = {} ", n_basis_shell);
         let n_auxbas_shell = self.mol.cint_aux_bas.len();
 
         let mut mat_partial_x = RIFull::new([n_basis,n_basis,n_auxbas], 0.0_f64);
         let mut mat_partial_y = RIFull::new([n_basis,n_basis,n_auxbas], 0.0_f64);
         let mut mat_partial_z = RIFull::new([n_basis,n_basis,n_auxbas], 0.0_f64);
 
-/*         for k in 0..n_auxbas_shell {
+        for k in 0..n_auxbas_shell {
             let basis_start_k = self.mol.cint_aux_fdqc[k][0];
             let basis_len_k = self.mol.cint_aux_fdqc[k][1];
             let gk  = k + n_basis_shell;
-            println!("basis_start_k = {} ", basis_start_k);
-            println!("basis_len_k = {} ", basis_len_k);
-            println!("gk = {} ", gk);
-
             for j in 0..n_basis_shell {
                 let basis_start_j = self.mol.cint_fdqc[j][0];
                 let basis_len_j = self.mol.cint_fdqc[j][1];
@@ -488,26 +495,6 @@ impl Gradient {
                 for i in 0..n_basis_shell {
                     let basis_start_i = self.mol.cint_fdqc[i][0];
                     let basis_len_i = self.mol.cint_fdqc[i][1];
-                    println!("i,j,k = {} {} {}", i, j, gk);
-                    println!("env = {:?}", self.mol.cint_env);
-                    println!("aux_env = {:?}", self.mol.cint_aux_env);
- */
-        for i in 0..n_basis_shell {
-            let basis_start_i = self.mol.cint_fdqc[i][0];
-            let basis_len_i = self.mol.cint_fdqc[i][1];
-            for j in 0..n_basis_shell {
-                let basis_start_j = self.mol.cint_fdqc[j][0];
-                let basis_len_j = self.mol.cint_fdqc[j][1];
-                // can be optimized with "for i in 0..(j+1)"
-                // currently we still use RIFull, to be optimized later
-                for k in 0..n_auxbas_shell {
-                    let basis_start_k = self.mol.cint_aux_fdqc[k][0];
-                    let basis_len_k = self.mol.cint_aux_fdqc[k][1];
-                    let gk  = k + n_basis_shell;
-                    println!("i,j,k = {} {} {}", i, j, k);
-                    println!("env = {:?}", self.mol.cint_env);
-                    println!("aux_env = {:?}", self.mol.cint_aux_env);
-
                     let buf = cint_data.cint_ip_3c2e(i as i32, j as i32, gk as i32, &cur_op);
                     let buf_len = buf.len()/3;
                     let mut buf_chunk = buf.chunks_exact(buf_len);
@@ -684,7 +671,7 @@ impl Gradient {
 
     }
 
-    pub fn calc_j(&self, scf_data: &SCF) -> (Vec<MatrixFull<f64>>,Option<Vec<Vec<f64>>>) {
+    pub fn calc_j(&self, scf_data: &SCF) -> (Vec<MatrixFull<f64>>,Option<Vec<MatrixFull<f64>>>) {
         let ao_loc = self.mol.ao_loc();
         let nbas = self.mol.fdqc_bas.len();
         let nauxbas = self.mol.fdqc_aux_bas.len();
@@ -702,11 +689,6 @@ impl Gradient {
         //let nset = 1_usize;  // temporarily set to 1, maybe 1 or 2
         // let nset = dm.len();    //number of density matrix? Yes, it is decided by spin channel
         // dm[0]/dm[1] is density matrix
-        // 
-        //test if 2c2e works properly
-        //println!("signal1");
-        //let int2c_e1 = self.ip_2c2e_intor(); //[3,naux,naux]
-        //println!("signal2");
 
         // python: 
         // get a lower matrix
@@ -748,9 +730,6 @@ impl Gradient {
         let int3c = self.mol.int_ijk_rifull();
         let mut ijp_symm = int3c.rifull_to_matfull_symm(); // reduce RIFull according to its symmetry, [36,131]
         // [nao*(nao+1)/2, naux]**T * [nao*(nao+1)/2, nset] -> [naux,nset]
-        //let mut rho = _dgemm_nn(&ijp_symm.transpose().to_matrixfullslice(),&dm_mat.to_matrixfullslice()); //[naux,nset]
-        //let mut rho = MatrixFull::new([naux,nset], 0.0_f64);
-        //_dgemm_full(&ijp_symm,'T',&dm_mat,'N',&mut rho,1.0,0.0); //[naux,nset]
         let mut rho = _dgemm_full_new(&ijp_symm,'T',&dm_mat,'N',1.0,0.0); //[naux,nset]
         //println!("test point 1");
         //rho.formated_output_e(150, "full");
@@ -781,35 +760,7 @@ impl Gradient {
 
         //println!("test point 2");
         //rhoj.formated_output_e(150, "full"); 
-        // test complete by here, nothing wrong by here
-
-
-        // test int3c2e
-        let mut test_grad = self.clone();
-        test_grad.mol.cint_atm = vec![vec![ 1, 20,  1, 23,  0,  0],
-                                 vec![ 1, 24,  1, 27,  0,  0],
-                                 vec![ 1, 54,  1, 57,  0,  0],
-                                 vec![ 1, 58,  1, 61,  0,  0]];
-        test_grad.mol.cint_bas = vec![vec![ 0,  0,  3,  1,  0, 28, 31,  0],
-                                 vec![ 1,  0,  3,  1,  0, 28, 31,  0],
-                                 vec![ 2,  0,  3,  1,  0, 62, 65,  0],
-                                 vec![ 3,  0,  3,  1,  0, 62, 65,  0]];
-        test_grad.mol.cint_env = vec![ 0.         , 0.         , 0.         , 0.         , 0.         , 0.        ,
-                                  0.         , 0.         , 0.         , 0.         , 0.         , 0.        ,
-                                  0.         , 0.         , 0.         , 0.         , 0.         , 0.        ,
-                                  0.         , 0.         ,
-                                  0.         , 0.         , 0.         , 0.         ,
-                                  0.         , 0.         , 1.41729459 , 0.         ,
-                                  3.42525091 , 0.62391373 , 0.1688554  , 0.98170673 , 0.94946401 , 0.29590646,
-                                  0.         , 0.         ,
-                                  0.         , 0.         , 0.         , 0.         , 0.         , 0.        ,
-                                  0.         , 0.         , 0.         , 0.         , 0.         , 0.        ,
-                                  0.         , 0.         , 0.         , 0.         , 0.         , 0.        ,
-                                  0.         , 0.         , 0.         , 0.         ,
-                                  0.         , 0.         , 1.41729459 , 0.         ,
-                                  22.068343  , 4.3905712  , 1.0540787  , 1.09168629 , 2.42003469,  1.92922056];
-        let test_ip1 = test_grad.ip_3c2e_intor(&String::from("ip1"));
-        // test end here
+        // test complete by here
 
         // (d/dX i,j|P)
         let origin_mat = MatrixFull::new([nao,nao], 0.0_f64);
@@ -818,14 +769,11 @@ impl Gradient {
         // vj += numpy.einsum('xijp,np->nxij', int3c, rhoj[:,p0:p1])
         // REST just einsum by x, y, z respectively
         let rhoj_alpha = MatrixFull::from_vec([rhoj.size[0],1], rhoj.data[0..rhoj.size[0]].to_vec()).unwrap();
-        rhoj_alpha.formated_output_e(150, "full"); 
+        //rhoj_alpha.formated_output_e(150, "full"); 
 
         let mut vj: Vec<MatrixFull<f64>> = int3c_ip1.iter()
             .map(|ri| { let mat = ri.rifull_to_matfull_ij_k();
                                       // [nao*nao,naux]*[naux,1] -> [nao*nao,1]
-                                      //let mut c = _dgemm_nn(&mat.to_matrixfullslice(), &rhoj_alpha.to_matrixfullslice());
-                                      //let mut c = MatrixFull::new([naux,1], 0.0_f64);
-                                      //_dgemm_full(&mat,'N',&rhoj_alpha,'N',&mut c,1.0,0.0); //[naux,1]
                                       let mut c = _dgemm_full_new(&mat,'N',&rhoj_alpha,'N',1.0,0.0); //[naux,1]
                                       c.reshape([nao,nao]);
                                       c
@@ -836,9 +784,6 @@ impl Gradient {
                 Some(int3c_ip1.iter()
                 .map(|ri| { let mat = ri.rifull_to_matfull_ij_k();
                                       // [nao*nao,naux]*[naux,1] -> [nao*nao,1]
-                                      //let mut c = _dgemm_nn(&mat.to_matrixfullslice(), &rhoj_beta.to_matrixfullslice());
-                                      //let mut c = MatrixFull::new([naux,1], 0.0_f64);
-                                      //_dgemm_full(&mat,'N',&rhoj_beta,'N',&mut c,1.0,0.0); //[naux,1]
                                       let mut c = _dgemm_full_new(&mat,'N',&rhoj_beta,'N',1.0,0.0); //[naux,1]
                                       c.reshape([nao,nao]);
                                       c
@@ -847,13 +792,14 @@ impl Gradient {
             None
             };
 
-        println!("test point 3");
-        for i in 0..vj.len() {
-            vj[i].formated_output_e(150, "full"); 
-        }
-
+        //println!("test point 3");
+        //println!("vj");
+        //for i in 0..vj.len() {
+        //     vj[i].formated_output_e(150, "full"); 
+        //}
+        // test complete by here
         
-        if self.mol.ctrl.auxbasis_response == true {
+        if self.mol.ctrl.auxbasis_response {
             // here a variable should be added in ctrl.in: auxbasis_response: True/False
             // if self.mol.ctrl.auxb_resp == True 
             // (i,j|d/dX P)
@@ -866,15 +812,21 @@ impl Gradient {
             let mut vjaux: Vec<MatrixFull<f64>> = int3c_ip2_matfull.iter()
                 .map(|x| {
                                             // [36,nset]**T*[36*131] -> [nset,131]*3
-                                            //let temp = _dgemm_nn(&dm_mat.transpose().to_matrixfullslice(), &x.to_matrixfullslice()).transpose(); 
-                                            //let mut temp = MatrixFull::new([naux,nset],0.0_f64);
-                                            //_dgemm_full(&dm_mat,'T',x,'N',&mut temp,1.0,0.0); //[naux,nset]
                                             let mut temp = _dgemm_full_new(&dm_mat,'T',x,'N',1.0,0.0); //[naux,nset]
-                                            temp = temp.transpose();
-                                            temp+rhoj.clone()
+                                            temp = _einsum_general(&temp, &rhoj, "ij,ij->j"); //[nset,naux]*[nset,naux]->naux
+                                            //temp = _dgemm_full_new(&temp,'T',&rhoj,'T',1.0,0.0); //[naux,nset]
+                                            temp
                                             }).collect();
             // Here we use Matrixfull for substraction later
             // let vjaux: Vec<Vec<f64>> = c1.iter().map(|x| x.data).collect(); 
+            
+            //println!("test point 4");
+            //println!("vjaux shape = {}, {} ", vjaux.len(), vjaux[0].data.len());
+            //println!("vjaux");
+            //for i in 0..vjaux.len() {
+            //     vjaux[i].formated_output_e(150, "full"); 
+            //}
+            // test complete by here
                                         
             // (d/dX P|Q)
             // [3,131,131]
@@ -882,16 +834,32 @@ impl Gradient {
             let mut vjaux2: Vec<MatrixFull<f64>> = int2c_e1.iter()
                 .map(|x| { 
                                             //[naux,naux]*[naux,nset] -> [naux,nset]
-                                            //let temp = _dgemm_nn(&x.to_matrixfullslice(), &rhoj.to_matrixfullslice());
-                                            //let mut temp = MatrixFull::new([naux,nset],0.0_f64);
-                                            //_dgemm_full(x,'T',&rhoj,'N',&mut temp,1.0,0.0);//[naux,nset]
                                             let mut temp = _dgemm_full_new(x,'T',&rhoj,'N',1.0,0.0);//[naux,nset]
-                                            temp+rhoj.clone()
+                                            temp = _einsum_general(&temp.transpose(), &rhoj, "ij,ij->j"); //[nset,naux]*[nset,naux]->naux
+                                            temp
+                                            //temp+rhoj.clone()
                                             }).collect();
+            
+            //println!("test point 5");
+            //println!("vjaux2 shape = {}, {} ", vjaux2.len(), vjaux2[0].data.len());
+            //println!("vjaux2");
+            //for i in 0..vjaux2.len() {
+            //     vjaux2[i].formated_output_e(150, "full"); 
+            //}
+            // test complete by here
+
             //rhoj [naux, nset]
             //vjaux -= numpy.einsum('xpq,mp,nq->xp', int2c_e1, rhoj, rhoj)
-            //actually 3*[131,131] [131,nset] [131,nset] -> [3,131,nset]
-            vjaux.iter_mut().zip(vjaux2).for_each(|(x1,x2)| *x1-=x2);
+            //actually 3*[131,131] [131,nset] [131,nset] -> [3,131]
+            vjaux.iter_mut().zip(vjaux2).for_each(|(x1,x2)| *x1+=x2);
+
+            //println!("test point 6");
+            //println!("vjaux shape = {}, {} ", vjaux.len(), vjaux[0].data.len());
+            //println!("vjaux");
+            //for i in 0..vjaux.len() {
+            //     vjaux[i].formated_output_e(150, "full"); 
+            //}
+            // test complete by here
 
             let mut vjaux_final_data = vec![];
             for slice in &auxslices {
@@ -923,13 +891,21 @@ impl Gradient {
                 
             }
 
-            // vj needs to be multiplied by -1, but currently we just test its number
+            //println!("test point 7");
+            //println!("vjaux_final_data shape = {}, {} ", vjaux_final_data.len(), vjaux_final_data[0].len());
+            //println!("vjaux_final_data = {:?}", vjaux_final_data);
+            // test complete for vj and vjaux
+
+            let vjaux_final_data_mat: Vec<MatrixFull<f64>> = vjaux_final_data.into_iter()
+                        .map(|j| MatrixFull::from_vec([j.len(),1], j).unwrap()).collect();
+
+
             match vj_beta {
                 Some(_) => vj.append(&mut vj_beta.unwrap()),
                 None => (),
             }
 
-            return (vj, Some(vjaux_final_data))
+            return (vj, Some(vjaux_final_data_mat))
 
 
         } else {
@@ -940,12 +916,10 @@ impl Gradient {
 
             return (vj, None)
         }
-        
-
 
     }
 
-    pub fn calc_k(&self, scf_data: &SCF) -> (Vec<MatrixFull<f64>>,Option<Vec<Vec<f64>>>) {
+    pub fn calc_k(&self, scf_data: &SCF) -> (Vec<MatrixFull<f64>>,Option<Vec<MatrixFull<f64>>>) {
         // in pyscf, it uses HDF5 file to temporarily save data, but REST currently just use memory to save data
         let nao = self.mol.num_basis;
         let naux = self.mol.num_auxbas;
@@ -972,24 +946,41 @@ impl Gradient {
         //mo_occ   = numpy.asarray(mo_occ).reshape(-1,nmo)
         // here pyscf convert mo_coeff shape to [nset,nao,nmo], mo_occ [nset,1,nmo]
         //
-        let einsum_b: Vec<f64> = mo_occ.iter().filter(|v| **v>0.0).map(|v| v.sqrt()).collect();
+        let einsum_b: Vec<f64> = mo_occ.iter().filter(|v| **v>0.0).map(|v| -v.sqrt()).collect();
+        let einsum_b = MatrixFull::from_vec([einsum_b.len(),1], einsum_b).unwrap();
+        //println!("test point 6");
+        //println!("einsum_b = {:?}", einsum_b);
         let orbo_idx: Vec<usize> = mo_occ.iter().enumerate().filter(|(i,v)| **v>0.0).map(|(i,v)| i).collect();
         let occ = orbo_idx.len();        
         let einsum_a_vec: Vec<f64> = orbo_idx.iter().map(|i| mo_coeff[(..,*i)].to_vec()).flatten().collect();
         let einsum_a = MatrixFull::from_vec([nao,occ], einsum_a_vec).unwrap();
-        let orbo_data: Vec<f64> = einsum_a.iter_columns_full().zip(einsum_b).map(|(a,b)| a.to_vec().iter().map(|i| i*b).collect::<Vec<f64>>()).flatten().collect();
-        let orbo = MatrixFull::from_vec([nao,occ], orbo_data).unwrap();
+        //println!("einsum_a = ");
+        //einsum_a.formated_output_e(150, "full");
+        //println!("mo_coeff = ");
+        //mo_coeff.formated_output_e(150, "full");
+        
+        //let orbo_data: Vec<f64> = einsum_a.iter_columns_full().zip(einsum_b).map(|(a,b)| a.to_vec().iter().map(|i| -1.0*i*b).collect::<Vec<f64>>()).flatten().collect();
+        //let orbo = MatrixFull::from_vec([nao,occ], orbo_data).unwrap();
+        let orbo = _einsum_general(&einsum_b, &einsum_a, "i,ij->ij");
+
+        //println!("test point k1");
+        //println!("orbo shape = {:?}", orbo.size);
+        //orbo.formated_output_e(150, "full");
+        // test complete
+
         let orbo_beta = if nset == 2 {
             let mo_coeff_beta = &scf_data.eigenvectors[1];
             let mo_occ_beta = &scf_data.occupation[1];
             let nmo_beta = mo_occ_beta.len();
-            let einsum_b_beta: Vec<f64> = mo_occ_beta.iter().filter(|v| **v>0.0).map(|v| v.sqrt()).collect();
+            let einsum_b_beta: Vec<f64> = mo_occ_beta.iter().filter(|v| **v>0.0).map(|v| -v.sqrt()).collect();
+            let einsum_b_beta = MatrixFull::from_vec([einsum_b_beta.len(),1], einsum_b_beta).unwrap();
             let orbo_idx_beta: Vec<usize> = mo_occ_beta.iter().enumerate().filter(|(i,v)| **v>0.0).map(|(i,v)| i).collect();
             let occ_beta = orbo_idx_beta.len();        
             let einsum_a_vec_beta: Vec<f64> = orbo_idx_beta.iter().map(|i| mo_coeff[(..,*i)].to_vec()).flatten().collect();
             let einsum_a_beta = MatrixFull::from_vec([nao,occ_beta], einsum_a_vec_beta).unwrap();
-            let orbo_data_beta: Vec<f64> = einsum_a_beta.iter_columns_full().zip(einsum_b_beta).map(|(a,b)| a.to_vec().iter().map(|i| i*b).collect::<Vec<f64>>()).flatten().collect();
-            let orbo_beta = MatrixFull::from_vec([nao,occ_beta], orbo_data_beta).unwrap();
+            //let orbo_data_beta: Vec<f64> = einsum_a_beta.iter_columns_full().zip(einsum_b_beta).map(|(a,b)| a.to_vec().iter().map(|i| -1.0*i*b).collect::<Vec<f64>>()).flatten().collect();
+            //let orbo_beta = MatrixFull::from_vec([nao,occ_beta], orbo_data_beta).unwrap();
+            let orbo_beta = _einsum_general(&einsum_b_beta, &einsum_a_beta, "i,ij->ij");
             Some(orbo_beta)
         } else {
             None
@@ -1000,44 +991,65 @@ impl Gradient {
             None => vec![orbo],
         };
         let orbo_len = orbo_vec.len();
+
         //(P|Q)
         
         let mut int2c = self.mol.int_ij_aux_columb();
-        // [naux, naux]
-        int2c.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
-        let int3c = self.mol.int_ijk_rifull();
-        // orbo [nao, occ] int3c [nao, nao, naux] -> [naux, nao, occ]
-        let int3c_iter = int3c.data.chunks_exact(nao*nao);
-        let v_data: Vec<f64> = int3c_iter.clone().map(|c| { let tmp = MatrixFull::from_vec([nao,nao], c.to_vec()).unwrap();
-                                                            //let tmp2 = _dgemm_nn(&tmp.to_matrixfullslice(), &orbo_vec[0].to_matrixfullslice()); //[lk][ko] -> [lo]
-                                                            //let mut tmp2 = MatrixFull::new([nao,occ],0.0_f64); //[lk][ko] -> [lo]
-                                                            //_dgemm_full(&tmp,'N',&orbo_vec[0],'N',&mut tmp2,1.0,0.0); 
-                                                            let tmp2 = _dgemm_full_new(&tmp,'N',&orbo_vec[0],'N',1.0,0.0); 
-                                                            tmp2.data }).flatten().collect(); //[nao,occ,naux]
-        let v = MatrixFull::from_vec([nao*occ,naux], v_data).unwrap(); //[nao*occ, naux]
-        //let v2 = _dgemm_nn(&v.to_matrixfullslice(),&int2c.to_matrixfullslice());//[nao*occ, naux]*[naux,naux]->[nao*occ,naux]
-        let v2 = _dgemm_full_new(&v,'N',&int2c,'N',1.0,0.0); //[nao*occ, naux]*[naux,naux]->[nao*occ,naux]
-        //let rhok = RIFull::from_vec([nao,occ,naux], v2.data).unwrap(); //[nao,occ,naux]
-        let rhok = v2.to_rifull(nao,occ,naux); //[nao,occ,naux]
-        
-        let mut rhok_beta = None;
-        if nset == 2 {
-            let v_data_beta: Vec<f64> = int3c_iter.map(|c| { let tmp_beta = MatrixFull::from_vec([nao,nao], c.to_vec()).unwrap();
-                                                            //let tmp2_beta = _dgemm_nn(&tmp_beta.to_matrixfullslice(), &orbo_vec[1].to_matrixfullslice()); //[lk][ko] -> [lo]
-                                                            let tmp2_beta = _dgemm_full_new(&tmp_beta,'N',&orbo_vec[1],'N',1.0,0.0); //[nao*occ, naux]*[naux,naux]->[nao*occ,naux]
-                                                            tmp2_beta.data }).flatten().collect(); //[nao,occ,naux]
-            let v_beta = MatrixFull::from_vec([nao*occ,naux], v_data_beta).unwrap(); //[nao*occ, naux]
-            //let v2_beta = _dgemm_nn(&v_beta.to_matrixfullslice(),&int2c.to_matrixfullslice());//[nao*occ, naux]*[naux,naux]->[nao*occ,naux]
-            //let mut v2_beta = MatrixFull::new([nao*occ,naux],0.0_f64);
-            //_dgemm_full(&v_beta,'N',&int2c,'N',&mut v2_beta,1.0,0.0); 
-            let v2_beta = _dgemm_full_new(&v_beta,'N',&int2c,'N',1.0,0.0); 
-            
+        let int2c_inv = int2c.lapack_inverse().unwrap();
+        //println!("test point k5");
+        //println!("int2c");
+        //int2c.formated_output_e(150, "full");
 
+        // [naux, naux]
+        // Warning: now we just use solve instead of cho_solve to get rhok
+        // Cholesky solve AX = B:
+        // 1) A = L*L**T
+        // 2) solve LY = B  =>  Y = L**-1*B
+        // 3) solve L**T*X = Y  =>  X = L**-T*B
+
+        //let mut int2c_cho = int2c.to_matrixfullslicemut().cholesky_decompose_inverse('L').unwrap();
+        //println!("int2c_cholesky");
+        //int2c.formated_output_e(150, "full");
+
+        let int3c = self.mol.int_ijk_rifull();
+        // orbo [nao, occ] int3c [nao, nao, naux] -> [occ, nao, naux]
+        let mut v = _dgemm_full_new(&orbo_vec[0], 'T', &int3c.rifull_to_matfull_i_jk(), 'N', 1.0, 0.0);  //[occ,nao*naux]
+        v = v.to_rifull(occ, nao, naux).rifull_to_matfull_ij_k();; //[occ*nao,naux]
+        //println!("test point k3");
+        //println!("v shape = {:?}", v.size);
+        //v.formated_output_e(150);
+        //test complete by here
+        //let v2 = _dgemm_full_new(&int2c,'N',&v,'T',1.0,0.0); //[naux,naux]*[nao*occ, naux]**T->[naux,nao*occ]
+        //let v2 = _dgemm_full_new(&int2c_cho.lapack_inverse().unwrap(),'N',&v,'T',1.0,0.0); //[naux,naux]**-1*[nao*occ, naux]**T->[naux,nao*occ]
+        //let v2 = _dgemm_full_new(&int2c_cho.lapack_inverse().unwrap(),'T',&v2,'N',1.0,0.0); //[naux,naux]**-1*[nao*occ, naux]**T->[naux,nao*occ]
+        
+        let v2 = _dgemm_full_new(&int2c_inv,'N',&v,'T',1.0,0.0); //[naux,naux]**-1*[nao*occ, naux]**T->[naux,nao*occ]
+        
+        //println!("test point k4");
+        //println!("v shape = {:?}", v2.size);
+        //v2.formated_output_e(150,"full");
+        let rhok = v2.to_rifull(naux,occ, nao).transpose_kji(); //[naux,occ, nao]->[nao,occ,naux]
+        
+        //println!("test point k2");
+        //println!("rhok shape = {:?}", rhok.size);
+        //rhok.formated_output_e(150);
+        //test complete by here, but in some columns data is not correct
+        //caused by some abnormal data in eigenvector
+
+        let mut rhok_beta = None;
+
+
+        if nset == 2 {
+            let mut v_beta = _dgemm_full_new(&orbo_vec[1], 'T', &int3c.rifull_to_matfull_i_jk(), 'N', 1.0, 0.0);  //[occ,nao*naux]
+            v_beta = v_beta.to_rifull(occ, nao, naux).rifull_to_matfull_ij_k();; //[occ*nao,naux]
+            let v2_beta = _dgemm_full_new(&int2c_inv,'N',&v_beta,'T',1.0,0.0); 
+        
             //let rhok_2 = RIFull::from_vec([nao,occ,naux], v2_beta.data).unwrap(); //[nao,occ,naux]
-            let rhok_2 = v2_beta.to_rifull(nao,occ,naux); //[nao,occ,naux]
+            let rhok_2 = v2_beta.to_rifull(naux,nao,occ).transpose_kji(); //[nao,occ,naux]
             
             rhok_beta = Some(rhok_2);
         }
+
 
         let rhok_vec = match rhok_beta {
             Some(_) => vec![rhok,rhok_beta.unwrap()],
@@ -1051,9 +1063,6 @@ impl Gradient {
         let tmp: Vec<RIFull<f64>> = int3c_ip1.iter().map(|ri| {
                                 let tmp_data: Vec<f64> = ri.data.chunks_exact(nao*nao).map(|chunk| {
                                                                             let tmp = MatrixFull::from_vec([nao,nao], chunk.to_vec()).unwrap();
-                                                                            //let tmp2 = _dgemm_nn(&tmp.to_matrixfullslice(), &orbo_vec[0].to_matrixfullslice()); //[nao,nao][nao,occ]->[nao,occ] 
-                                                                            //let mut tmp2 = MatrixFull::new([nao,occ],0.0_f64);
-                                                                            //_dgemm_full(&tmp,'N',&orbo_vec[0],'N',&mut tmp2,1.0,0.0); 
                                                                             let tmp2 = _dgemm_full_new(&tmp,'N',&orbo_vec[0],'N',1.0,0.0); 
                                                                             tmp2.data
                                                                         }).flatten().collect();
@@ -1064,9 +1073,6 @@ impl Gradient {
                 Some(int3c_ip1.iter().map(|ri| {
                     let tmp_data: Vec<f64> = ri.data.chunks_exact(nao*nao).map(|chunk| {
                                                                 let tmp = MatrixFull::from_vec([nao,nao], chunk.to_vec()).unwrap();
-                                                                //let tmp2 = _dgemm_nn(&tmp.to_matrixfullslice(), &orbo_vec[1].to_matrixfullslice()); //[nao,nao][nao,occ]->[nao,occ] 
-                                                                //let mut tmp2 = MatrixFull::new([nao,occ],0.0_f64);
-                                                                //_dgemm_full(&tmp,'N',&orbo_vec[1],'N',&mut tmp2,1.0,0.0); 
                                                                 let tmp2 = _dgemm_full_new(&tmp,'N',&orbo_vec[1],'N',1.0,0.0); 
                                                                 tmp2.data
                                                             }).flatten().collect();
@@ -1081,9 +1087,6 @@ impl Gradient {
         for i in 0..rhok_vec.len() {
             let rhok_matfull = rhok_vec[i].transpose_jki().rifull_to_matfull_ij_k(); //[occ*naux,nao]
             let mut vk_part: Vec<MatrixFull<f64>> = tmp.iter().map(|tmp| {let c1 = tmp.rifull_to_matfull_i_jk();  //[nao,occ*naux]
-                //_dgemm_nn(&c1.to_matrixfullslice(), &rhok_matfull.to_matrixfullslice())
-                //let mut tmp = MatrixFull::new([nao,nao],0.0_f64);
-                //_dgemm_full(&c1,'N',&rhok_matfull,'N',&mut tmp,1.0,0.0); 
                 let tmp = _dgemm_full_new(&c1,'N',&rhok_matfull,'N',1.0,0.0); 
                 tmp
             }).collect();
@@ -1091,118 +1094,114 @@ impl Gradient {
             vk.append(&mut vk_part);
         }
 
+        //println!("test point k7");
+        //println!("vk shape = {:?}", vk[0].size);
+        //for i in 0..vk.len() {
+        //    vk[i].formated_output_e(150,"full");
+        //}
+        //test complete by here
+
         let mut rhok_oo_vec = vec![];
         for i in 0..rhok_vec.len() {
-            let rhok = rhok_vec[i].transpose_kji(); // [naux,occ,nao]
-            let rhok_matfull2 = rhok_vec[i].rifull_to_matfull_ij_k(); //[naux*occ,nao]
-            //let rhok_oo = _dgemm_nn(&rhok_matfull2.to_matrixfullslice(), &orbo_vec[i].to_matrixfullslice()); //[naux*occ,nao][nao,occ] -> [naux*occ,occ]
-            //let mut rhok_oo = MatrixFull::new([naux*occ,occ], 0.0_f64);
-            //_dgemm_full(&rhok_matfull2,'N',&orbo_vec[i],'N',&mut rhok_oo,1.0,0.0); 
-            let rhok_oo = _dgemm_full_new(&rhok_matfull2,'N',&orbo_vec[i],'N',1.0,0.0); 
-            let rhok_oo = matfull_to_rifull(&rhok_oo, &naux, &occ); //[naux,occ,occ]
+            let rhok = rhok_vec[i].transpose_kji(); // [nao,occ,naux]
+            let rhok_matfull2 = rhok_vec[i].rifull_to_matfull_i_jk(); //
+            let rhok_oo = _dgemm_full_new(&orbo_vec[i],'T',&rhok_matfull2,'N',1.0,0.0); //[nao,occ]**T*[nao,occ*naux] -> [occ,occ*naux]
+            let rhok_oo = rhok_oo.to_rifull(occ,occ,naux); //[occ,occ,naux]
             rhok_oo_vec.push(rhok_oo)
         }
 
-        /* 
-        tmp = rhok_oo[i][p0:p1]
-                tmp = lib.einsum('por,ir->pio', tmp, orbo[i])
-                tmp = lib.einsum('pio,jo->pij', tmp, orbo[i])
-                vkaux[:,p0:p1] += lib.einsum('xpij,pij->xp', int3c, tmp)
+        //println!("test point k8");
+        //println!("rhok_oo_vec shape = {:?}", rhok_oo_vec[0].size);
+        //for i in 0..rhok_oo_vec.len() {
+        //    rhok_oo_vec[i].formated_output_e(150);
+        //}
+        //test complete by here
 
-         */
-
-        if self.mol.ctrl.auxbasis_response == true {
+        if self.mol.ctrl.auxbasis_response {
             //if mf_grad.auxbasis_response:
             // (i,j|d/dX P)
 
             //pyscf por,ir->pio [naux,occ,occ]*[nao,occ]-> [naux,nao,occ]
             //actually [naux*occ,occ]*[nao,occ]**T-> [naux,occ,nao]
             let mut int3c_ip2 = self.ip_3c2e_intor(&String::from("ip2")); // [3, nao, nao, naux], xijp
-            
-            //let tmp = _dgemm_nn(&rhok_oo_vec[0].rifull_to_matfull_ij_k().to_matrixfullslice(), &orbo_vec[0].transpose().to_matrixfullslice()); //[naux*occ,occ]*[nao,occ]**T-> [naux,occ,nao]
-            //let mut tmp = MatrixFull::new([naux*occ,nao],0.0_f64);
-            //_dgemm_full(&rhok_oo_vec[0].rifull_to_matfull_ij_k(),'N',&orbo_vec[0],'T',&mut tmp,1.0,0.0); 
-            let tmp = _dgemm_full_new(&rhok_oo_vec[0].rifull_to_matfull_ij_k(),'N',&orbo_vec[0],'T',1.0,0.0); 
-            let tmp = matfull_to_rifull(&tmp, &naux, &occ); //[naux,occ,nao] poi
-            let tmp = tmp.transpose_ikj(); //[naux,nao,occ] pio
-            //let tmp = _dgemm_nn(&tmp.rifull_to_matfull_ij_k().to_matrixfullslice(), &orbo_vec[0].transpose().to_matrixfullslice()); //[naux*nao,occ]*[nao,occ]**T-> [naux*nao,nao]
-            //let mut tmp = MatrixFull::new([naux*nao,nao],0.0_f64);
-            //_dgemm_full(&tmp.rifull_to_matfull_ij_k(),'N',&orbo_vec[0],'T',&mut tmp,1.0,0.0); 
-            let tmp = _dgemm_full_new(&tmp.rifull_to_matfull_ij_k(),'N',&orbo_vec[0],'T',1.0,0.0); 
-
-
-            let tmp = matfull_to_rifull(&tmp, &naux, &nao); //[naux,nao,nao] pij
+            let tmp = _dgemm_full_new(&orbo_vec[0],'N',&rhok_oo_vec[0].rifull_to_matfull_i_jk(),'N',1.0,0.0); //[nao,occ]*[occ,occ*naux]-> [nao,occ,naux]
+            let tmp = tmp.to_rifull(nao, occ, naux).transpose_jik(); //[nao,occ,naux] iop -> [occ,nao,naux] oip
+            let tmp = _dgemm_full_new(&orbo_vec[0],'N',&tmp.rifull_to_matfull_i_jk(),'N',1.0,0.0); //[nao,occ]*[occ,nao*naux]-> [nao,nao,naux]
+            let tmp = tmp.to_rifull(nao, nao, naux); //[nao,nao,naux] jip
             //pyscf 'xpij,pij->xp' [3,naux, nao, nao] [naux,nao,nao] -> [3,naux]
             //actually 3*[nao, nao, naux] [naux,nao,nao] -> 
-            let mut vkaux: Vec<Vec<f64>> = int3c_ip2.iter().map(|ri| { let int3c_mat = ri.rifull_to_matfull_ij_k().transpose(); //[naux,nao*nao]
-                                                      let tmp_ri = tmp.transpose_jki(); // [nao,nao,naux]
-                                                      let tmp_mat = tmp_ri.rifull_to_matfull_ij_k(); //  
-                                                      //let result_mat = _dgemm_nn(&int3c_mat.to_matrixfullslice(), &tmp_mat.to_matrixfullslice()); // [naux,nao*nao]*[nao*nao,naux]-> [naux,naux]
-                                                      //_dgemm_full(&tmp.rifull_to_matfull_ij_k(),'N',&orbo_vec[0],'T',&mut tmp,1.0,0.0); 
-                                                      let result_mat = _dgemm_full_new(&int3c_mat,'N',&tmp_mat,'N',1.0,0.0); 
-                                                      
-                                                      result_mat.get_diagonal_terms().unwrap().into_iter().map(|v| *v).collect_vec()}).collect(); 
+            let mut vkaux: Vec<Vec<f64>> = int3c_ip2.iter().map(|ri| { 
+                                                      let result = _einsum_general(&tmp.rifull_to_matfull_ij_k(), &ri.rifull_to_matfull_ij_k(), "ij,ij->j");
+                                                      result.data
+                                                        }).collect(); 
+
+            //println!("test point k9");
+            //println!("vkaux shape = {:?}", vkaux[0].len());
+            //for i in 0..vkaux.len() {
+            //    println!("vkaux = {:?}", vkaux[i]);
+            //}
+            //test complete by here
             
             let mut vkaux_beta = None;
             if nset == 2 {
-                //let tmp_beta = _dgemm_nn(&rhok_oo_vec[1].rifull_to_matfull_ij_k().to_matrixfullslice(), &orbo_vec[1].transpose().to_matrixfullslice()); //[naux*occ,occ]*[nao,occ]**T-> [naux,occ,nao]
-                let tmp_beta = _dgemm_full_new(&rhok_oo_vec[1].rifull_to_matfull_ij_k(),'N',&orbo_vec[1],'T',1.0,0.0); 
-                let tmp_beta = matfull_to_rifull(&tmp_beta, &naux, &occ); //[naux,occ,nao] poi
-                let tmp_beta = tmp_beta.transpose_ikj(); //[naux,nao,occ] pio
-                //let tmp_beta = _dgemm_nn(&tmp_beta.rifull_to_matfull_ij_k().to_matrixfullslice(), &orbo_vec[1].transpose().to_matrixfullslice()); //[naux*nao,occ]*[nao,occ]**T-> [naux*nao,nao]
-                let tmp_beta = _dgemm_full_new(&tmp_beta.rifull_to_matfull_ij_k(), 'N',&orbo_vec[1],'T',1.0,0.0); //[naux*nao,occ]*[nao,occ]**T-> [naux*nao,nao]
-                let tmp_beta = matfull_to_rifull(&tmp_beta, &naux, &nao); //[naux,nao,nao] pij
+                let tmp_beta = _dgemm_full_new(&orbo_vec[1],'N',&rhok_oo_vec[1].rifull_to_matfull_i_jk(),'N',1.0,0.0); //[nao,occ]*[occ,occ*naux]-> [nao,occ,naux]
+                let tmp_beta = tmp_beta.to_rifull(nao, occ, naux).transpose_jik(); //[nao,occ,naux] iop -> [occ,nao,naux] oip
+                let tmp_beta = _dgemm_full_new(&orbo_vec[1],'N',&tmp_beta.rifull_to_matfull_i_jk(),'N',1.0,0.0); //[nao,occ]*[occ,nao*naux]-> [nao,nao,naux]
+                let tmp_beta = tmp_beta.to_rifull(nao, nao, naux); //[nao,nao,naux] jip
                 //pyscf 'xpij,pij->xp' [3,naux, nao, nao] [naux,nao,nao] -> [3,naux]
                 //actually 3*[nao, nao, naux] [naux,nao,nao] -> 
-                let mut vkaux_tmp: Vec<Vec<f64>> = int3c_ip2.iter().map(|ri| { let int3c_mat = ri.rifull_to_matfull_ij_k().transpose(); //[naux,nao*nao]
-                                                          let tmp_ri = tmp_beta.transpose_jki(); // [nao,nao,naux]
-                                                          let tmp_mat = tmp_ri.rifull_to_matfull_ij_k(); //  
-                                                          //let result_mat = _dgemm_nn(&int3c_mat.to_matrixfullslice(), &tmp_mat.to_matrixfullslice()); // [naux,nao*nao]*[nao*nao,naux]-> [naux,naux]
-                                                          let result_mat = _dgemm_full_new(&int3c_mat, 'N',&tmp_mat,'N',1.0,0.0); //[naux,nao*nao]*[nao*nao,naux]-> [naux,naux]
-                                                          result_mat.get_diagonal_terms().unwrap().into_iter().map(|v| *v).collect_vec()}).collect(); 
+                let mut vkaux_tmp: Vec<Vec<f64>> = int3c_ip2.iter().map(|ri| { 
+                                        let result = _einsum_general(&tmp_beta.rifull_to_matfull_ij_k(), &ri.rifull_to_matfull_ij_k(), "ij,ij->j");
+                                        result.data
+                                        }).collect(); 
                 vkaux_beta = Some(vkaux_tmp);
             };
             
             // (d/dX P|Q)
             /* 
              int2c_e1 = auxmol.intor('int2c2e_ip1')
-            vjaux -= numpy.einsum('xpq,mp,nq->xp', int2c_e1, rhoj, rhoj)
             for i in range(nset):
                 tmp = lib.einsum('pij,qij->pq', rhok_oo[i], rhok_oo[i])
                 vkaux -= numpy.einsum('xpq,pq->xp', int2c_e1, tmp)
 
-            vjaux = [-vjaux[:,p0:p1].sum(axis=1) for p0, p1 in auxslices[:,2:]]
             vkaux = [-vkaux[:,p0:p1].sum(axis=1) for p0, p1 in auxslices[:,2:]]
             vj = lib.tag_array(-vj.reshape(out_shape), aux=numpy.array(vjaux))
             vk = lib.tag_array(-vk.reshape(out_shape), aux=numpy.array(vkaux))
              */
             let int2c_e1 = self.ip_2c2e_intor(); //[3,naux,naux]
-            // rhok_oo [naux,occ,occ] pij 
-            let rhok_oo_mat = rhok_oo_vec[0].rifull_to_matfull_i_jk(); //[naux,occ*occ]
-            //let tmp2 = _dgemm_nn(&rhok_oo_mat.to_matrixfullslice(), &rhok_oo_mat.transpose().to_matrixfullslice()); //[naux,occ*occ]*[naux,occ*occ]**T-> [naux,naux]
-            let tmp2 = _dgemm_full_new(&rhok_oo_mat, 'N',&rhok_oo_mat,'T',1.0,0.0); //[naux,occ*occ]*[naux,occ*occ]**T-> [naux,naux]
+            // rhok_oo [occ,occ,naux] jip
+            let rhok_oo_mat = rhok_oo_vec[0].rifull_to_matfull_ij_k(); //[occ*occ,naux]
+            let tmp2 = _dgemm_full_new(&rhok_oo_mat, 'T',&rhok_oo_mat,'N',1.0,0.0); //[occ*occ,naux]**T*[occ*occ,naux] -> [naux,naux]
             let vkaux2: Vec<Vec<f64>> = int2c_e1.iter().map(|mat| { 
-                                                        //let result_mat = _dgemm_nn(&mat.to_matrixfullslice(), &tmp2.transpose().to_matrixfullslice()); //[naux,naux]*[naux,naux]**T -> [naux,naux]
-                                                        let result_mat = _dgemm_full_new(mat, 'N',&tmp2,'T',1.0,0.0); //[naux,naux]*[naux,naux]**T -> [naux,naux]
-                                                        result_mat.get_diagonal_terms().unwrap().into_iter().map(|v| *v).collect_vec()}).collect(); //[naux,naux]->[naux]
+                                                        let result = _einsum_general(mat, &tmp2, "ij,ij->i");  //[naux,naux]*[naux,naux]**T -> [naux,naux]
+                                                        result.data
+                                                    }).collect(); //[naux,naux]->[naux]
             vkaux.iter_mut().zip(vkaux2).for_each(|(vk1, vk2)| vk1.iter_mut().zip(vk2).for_each(|(v1,v2)| *v1-=v2));
             
             let vkaux: Vec<MatrixFull<f64>> = vkaux.iter().map(|v| MatrixFull::from_vec([naux,1], v.clone()).unwrap()).collect();
 
+            //println!("test point k10");
+            //println!("vkaux shape = {:?}", vkaux[0].size);
+            //for i in 0..vkaux.len() {
+            //    vkaux[i].formated_output_e(150, "full")
+            //}
+            //test complete by here
+
             let vkaux_beta = match vkaux_beta {
                 Some(_) => {
-                    let rhok_oo_mat_beta = rhok_oo_vec[0].rifull_to_matfull_i_jk(); //[naux,occ*occ]
-                    //let tmp2_beta = _dgemm_nn(&rhok_oo_mat_beta.to_matrixfullslice(), &rhok_oo_mat_beta.transpose().to_matrixfullslice()); //[naux,occ*occ]*[naux,occ*occ]**T-> [naux,naux]
-                    let tmp2_beta = _dgemm_full_new(&rhok_oo_mat_beta, 'N',&rhok_oo_mat_beta,'T',1.0,0.0); //[naux,occ*occ]*[naux,occ*occ]**T-> [naux,naux]
+
+                    let rhok_oo_mat_beta = rhok_oo_vec[1].rifull_to_matfull_ij_k(); //[occ*occ,naux]
+                    let tmp2_beta = _dgemm_full_new(&rhok_oo_mat_beta, 'T',&rhok_oo_mat_beta,'N',1.0,0.0); //[occ*occ,naux]**T*[occ*occ,naux] -> [naux,naux]
                     let vkaux2_beta: Vec<Vec<f64>> = int2c_e1.iter().map(|mat| { 
-                                                                //let result_mat = _dgemm_nn(&mat.to_matrixfullslice(), &tmp2_beta.transpose().to_matrixfullslice()); //[naux,naux]*[naux,naux]**T -> [naux,naux]
-                                                                let result_mat = _dgemm_full_new(mat, 'N',&tmp2_beta,'T',1.0,0.0); //[naux,naux]*[naux,naux]**T -> [naux,naux]
-                                                                result_mat.get_diagonal_terms().unwrap().into_iter().map(|v| *v).collect_vec()}).collect(); //[naux,naux]->[naux]
+                                                                let result = _einsum_general(mat, &tmp2_beta, "ij,ij->i");  //[naux,naux]*[naux,naux]**T -> [naux,naux]
+                                                                result.data
+                                                            }).collect(); //[naux,naux]->[naux]
                     let mut vkaux_beta_u = vkaux_beta.unwrap();
                     vkaux_beta_u.iter_mut().zip(vkaux2_beta).for_each(|(vk1, vk2)| vk1.iter_mut().zip(vk2).for_each(|(v1,v2)| *v1-=v2));
                     
                     let vkaux_tmp: Vec<MatrixFull<f64>> = vkaux_beta_u.iter().map(|v| MatrixFull::from_vec([naux,1], v.clone()).unwrap()).collect();
                     Some(vkaux_tmp)
+    
                 },
                 None => None,
             };
@@ -1237,8 +1236,16 @@ impl Gradient {
                 }
             }
 
-            // vk needs to be multiplied by -1, but currently we just test its number
-            return (vk, Some(vkaux_final_data))
+            //println!("test point k11");
+            //println!("vkaux_final_data shape = {}, {} ", vkaux_final_data.len(), vkaux_final_data[0].len());
+            //println!("vkaux_final_data = {:?}", vkaux_final_data);
+            //test complete
+
+            let vkaux_final_data_mat: Vec<MatrixFull<f64>> = vkaux_final_data.into_iter()
+                        .map(|k| MatrixFull::from_vec([k.len(),1], k).unwrap()).collect();
+
+
+            return (vk, Some(vkaux_final_data_mat))
         }
         else {
             return (vk, None)
@@ -1252,8 +1259,18 @@ impl Gradient {
 
     }
 
-    pub fn calc_veff_deriv(){
+    pub fn calc_veff_deriv(&self, scf_data: &SCF) -> (Vec<MatrixFull<f64>>, Option<Vec<MatrixFull<f64>>>){
+        let (vj, vjaux) = self.calc_j(scf_data);
+        let (vk, vkaux) = self.calc_k(scf_data);
+        let vhf: Vec<MatrixFull<f64>> = vj.into_iter().zip(vk).map(|(j,k)| j-k*0.5_f64).collect();
+        let mut e1_aux = None;
+        if self.mol.ctrl.auxbasis_response {
+            let e1_aux_value: Vec<MatrixFull<f64>> = vjaux.unwrap().into_iter().zip(vkaux.unwrap()).map(|(j,k)| j-k*0.5_f64).collect();
+            e1_aux = Some(e1_aux_value)
+        }
 
+
+        (vhf, e1_aux)
     }
 
 
